@@ -32,6 +32,7 @@ from plexpy import logger
 from plexpy.database import MonitorDatabase
 from plexpy.helpers import timestamp
 from plexpy.users import Users, refresh_users
+from plexpy.oidc import OIDCClient, _make_state_cookie, _pop_state_cookie
 from plexpy.plextv import PlexTV
 
 # Monkey patch SameSite support into cookies.
@@ -270,6 +271,9 @@ def check_rate_limit(ip_address):
 class AuthController(object):
 
     def check_auth_enabled(self):
+        # Allow login page if any authentication method is enabled
+        if plexpy.CONFIG.OIDC_ENABLED:
+            return
         if not plexpy.CONFIG.HTTP_BASIC_AUTH and plexpy.CONFIG.HTTP_PASSWORD:
             return
         raise cherrypy.HTTPRedirect(plexpy.HTTP_ROOT)
@@ -344,6 +348,125 @@ class AuthController(object):
             redirect_uri = '?redirect_uri=' + redirect_uri
 
         raise cherrypy.HTTPRedirect(plexpy.HTTP_ROOT + "auth/login" + redirect_uri)
+
+    @cherrypy.expose
+    def oidc_login(self, redirect_uri='', remember_me='1', *args, **kwargs):
+        self.check_auth_enabled()
+
+        if not plexpy.CONFIG.OIDC_ENABLED:
+            raise cherrypy.HTTPError(404)
+
+        try:
+            client = OIDCClient()
+        except cherrypy.HTTPError:
+            raise
+
+        # Generate state and nonce
+        if hasattr(__import__('sys'), 'version_info') and __import__('sys').version_info >= (3, 6):
+            import secrets
+            state = secrets.token_urlsafe(16)
+            nonce = secrets.token_urlsafe(16)
+        else:
+            import os, base64
+            state = base64.urlsafe_b64encode(os.urandom(12)).decode('utf-8')
+            nonce = base64.urlsafe_b64encode(os.urandom(12)).decode('utf-8')
+
+        _make_state_cookie(redirect_uri=redirect_uri, remember_me=remember_me == '1', nonce=nonce, state=state)
+
+        auth_url = client.build_authorization_url(state=state, nonce=nonce)
+        raise cherrypy.HTTPRedirect(auth_url)
+
+    @cherrypy.expose
+    def oidc_callback(self, code=None, state=None, error=None, *args, **kwargs):
+        self.check_auth_enabled()
+
+        if not plexpy.CONFIG.OIDC_ENABLED:
+            raise cherrypy.HTTPError(404)
+
+        if error:
+            logger.warn('Tautulli WebAuth :: OIDC authorization error: %s', error)
+            raise cherrypy.HTTPRedirect(plexpy.HTTP_ROOT + 'auth/login')
+
+        payload = _pop_state_cookie()
+        if not payload or not state or payload.get('state') != state:
+            logger.warn('Tautulli WebAuth :: OIDC state validation failed.')
+            raise cherrypy.HTTPRedirect(plexpy.HTTP_ROOT + 'auth/login')
+
+        try:
+            client = OIDCClient()
+        except cherrypy.HTTPError:
+            raise
+
+        try:
+            token_resp = client.exchange_code_for_tokens(code)
+        except cherrypy.HTTPError:
+            raise
+
+        id_token = token_resp.get('id_token')
+        access_token = token_resp.get('access_token')
+
+        claims = {}
+        # Prefer userinfo when available
+        if access_token:
+            ui = client.fetch_userinfo(access_token)
+            if isinstance(ui, dict):
+                claims = ui
+
+        # Fallback: decode id_token without signature verification (still over TLS)
+        if not claims and id_token:
+            try:
+                claims = jwt.decode(id_token, options={"verify_signature": False, "verify_aud": False})
+            except Exception:
+                claims = {}
+
+        username_claim = plexpy.CONFIG.OIDC_USERNAME_CLAIM or 'preferred_username'
+        email_claim = plexpy.CONFIG.OIDC_EMAIL_CLAIM or 'email'
+        username = claims.get(username_claim) or claims.get('name') or claims.get('preferred_username')
+        email = claims.get(email_claim)
+
+        # Determine if user is allowed and is admin based on email allowlist
+        allowed_admins = [e.strip().lower() for e in (plexpy.CONFIG.OIDC_ADMIN_EMAILS or '').split(',') if e.strip()]
+        is_admin = bool(email and email.lower() in allowed_admins) if allowed_admins else False
+
+        if not is_admin:
+            logger.warn("Tautulli WebAuth :: OIDC user '%s' (%s) is not authorized to access Tautulli.", username, email)
+            raise cherrypy.HTTPRedirect(plexpy.HTTP_ROOT + 'auth/login')
+
+        # Successful login – create Tautulli JWT session as admin
+        time_delta = timedelta(days=30) if payload.get('remember_me') == 1 else timedelta(minutes=60)
+        expiry = datetime.now(tz=timezone.utc) + time_delta
+
+        session_payload = {
+            'user_id': None,
+            'user': username or (email or 'OIDC User'),
+            'user_group': 'admin',
+            'exp': expiry
+        }
+
+        jwt_token = jwt.encode(session_payload, plexpy.CONFIG.JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+        self.on_login(username=session_payload['user'],
+                      user_id=None,
+                      user_group='admin',
+                      success=True,
+                      oauth=True,
+                      expiry=expiry,
+                      jwt_token=jwt_token)
+
+        jwt_cookie = str(JWT_COOKIE_NAME + plexpy.CONFIG.PMS_UUID)
+        cherrypy.response.cookie[jwt_cookie] = jwt_token
+        cherrypy.response.cookie[jwt_cookie]['max-age'] = int(time_delta.total_seconds())
+        cherrypy.response.cookie[jwt_cookie]['path'] = plexpy.HTTP_ROOT.rstrip('/') or '/'
+        cherrypy.response.cookie[jwt_cookie]['httponly'] = True
+        cherrypy.response.cookie[jwt_cookie]['samesite'] = 'lax'
+
+        cherrypy.request.login = session_payload
+
+        redirect_uri = payload.get('redirect_uri', '')
+        if redirect_uri:
+            redirect_uri = '?redirect_uri=' + quote(redirect_uri)
+
+        raise cherrypy.HTTPRedirect(plexpy.HTTP_ROOT + 'auth/redirect' + redirect_uri)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()

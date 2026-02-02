@@ -1,6 +1,7 @@
 ﻿<%
-    import plexpy
-    plex_login = plexpy.CONFIG.HTTP_PLEX_ADMIN or plexpy.CONFIG.ALLOW_GUEST_ACCESS
+	import plexpy
+	plex_login = plexpy.CONFIG.HTTP_PLEX_ADMIN or plexpy.CONFIG.ALLOW_GUEST_ACCESS
+	oidc_enabled = plexpy.CONFIG.OIDC_ENABLED
 %>
 <!doctype html>
 
@@ -71,6 +72,25 @@
                                 </ul>
                             </li>
                             % endif
+                            % if oidc_enabled:
+                            <li class="${'open' if not plex_login else ''}">
+                                <div class="link login-method-header">
+                                    Sign In with OpenID Connect
+                                </div>
+                                <ul class="submenu" style="${'display: block;' if (not plex_login) else ''}">
+                                    <li>
+                                        <div>
+                                            <button id="sign-in-oidc" class="btn btn-bright login-button"><i class="fa fa-sign-in"></i>&nbsp; Sign In</button>
+                                        </div>
+                                        <div class="remember-group">
+                                            <label class="control-label">
+                                                <input type="checkbox" id="remember_me_oidc" name="remember_me_oidc" title="for 30 days" value="1" checked="checked" /> Remember me
+                                            </label>
+                                        </div>
+                                    </li>
+                                </ul>
+                            </li>
+                            % endif
                             <li class="${'open' if not plex_login else ''}">
                                 <div class="link login-method-header">
                                     Sign In with Tautulli
@@ -125,6 +145,11 @@
 
     $('#sign-in-plex').click(function() {
         PlexOAuth(OAuthSuccessCallback, OAuthErrorCallback);
+    });
+
+    $('#sign-in-oidc').click(function() {
+        const remember_me = $('#remember_me_oidc').is(':checked') ? '1' : '0';
+        window.location = '${http_root}auth/oidc/login?remember_me=' + remember_me + '&redirect_uri=${redirect_uri}';
     });
 
     $('#login-form').submit(function(event) {
